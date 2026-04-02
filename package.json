@@ -1,0 +1,13 @@
+{
+  "name": "aegis-mcp-client",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "aegis-scrape": "./dist/mcp-server.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/mcp-server.js",
+    "dev": "tsc -w"
+  }
+}
