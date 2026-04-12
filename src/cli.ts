@@ -34,8 +34,28 @@ const publicClient = createPublicClient({
   transport: http(RPC_URL),
 });
 
-// --- IDENTITY MANAGEMENT (Unchanged) ---
+// --- IDENTITY MANAGEMENT ---
 function getOrCreateIdentity() {
+  // 🔥 1. Check for Env Var Override first (For Production / Docker)
+  if (process.env.AEGIS_PRIVATE_KEY) {
+    try {
+      let pk = process.env.AEGIS_PRIVATE_KEY;
+      if (!pk.startsWith("0x")) pk = `0x${pk}`;
+
+      const account = privateKeyToAccount(pk as `0x${string}`);
+      return {
+        account,
+        activeTxHash: process.env.AEGIS_TX_HASH || null,
+      };
+    } catch (err) {
+      console.error(
+        "[Aegis] ❌ Invalid AEGIS_PRIVATE_KEY provided in environment variables.",
+      );
+      process.exit(1);
+    }
+  }
+
+  // 2. Fallback to physical file logic for local development
   if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
 
   if (existsSync(IDENTITY_PATH)) {
@@ -120,14 +140,17 @@ async function checkAndSweepFunds() {
             : { gasPrice }),
         });
 
-        const fileContent = await fsPromises.readFile(IDENTITY_PATH, "utf-8");
-        const identityData = JSON.parse(fileContent);
-        identityData.activeTxHash = hash;
-        await fsPromises.writeFile(
-          IDENTITY_PATH,
-          JSON.stringify(identityData, null, 2),
-          { mode: 0o600 },
-        );
+        // Only try to save the hash to disk if we are NOT using the env var override
+        if (!process.env.AEGIS_PRIVATE_KEY && existsSync(IDENTITY_PATH)) {
+          const fileContent = await fsPromises.readFile(IDENTITY_PATH, "utf-8");
+          const identityData = JSON.parse(fileContent);
+          identityData.activeTxHash = hash;
+          await fsPromises.writeFile(
+            IDENTITY_PATH,
+            JSON.stringify(identityData, null, 2),
+            { mode: 0o600 },
+          );
+        }
 
         globalTxHash = hash;
         console.error(`[Aegis] ✅ Credits initialized. Hash: ${hash}`);
@@ -140,8 +163,7 @@ async function checkAndSweepFunds() {
   });
 }
 
-// 🔥 NEW: SHARED CORE ENGINE
-// Both MCP and Daemon use this exact function to hit the backend
+// 🔥 SHARED CORE ENGINE
 async function executeScrapeRequest(url: string) {
   let currentHash;
   try {
