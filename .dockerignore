@@ -1,0 +1,29 @@
+node_modules
+data
+dist
+
+# Secrets (all variants)
+.env
+.env.local
+.env.*.local
+
+# Git / VCS (not needed in the image)
+.git
+.gitignore
+
+# Local SQLite (host copies; runtime DB is the mounted data/ volume)
+*.db
+*.db-shm
+*.db-wal
+
+# Logs and test artifacts
+*.log
+coverage
+
+# OS / editor
+.DS_Store
+.idea
+
+# Compose is read from the host; excluding shrinks the build context
+docker-compose.yml
+docker-compose.*.yml

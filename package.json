@@ -1,11 +1,14 @@
 {
-  "name": "aegis-mcp-client",
+  "name": "@aegis-m2m/cli",
   "version": "1.0.0",
+  "description": "The Web Scraper & API Gateway for Autonomous Agents",
   "type": "module",
-  "bin": "./dist/mcp-server.js",
+  "bin": {
+    "aegis-cli": "./dist/cli.js"
+  },
   "scripts": {
     "build": "tsc",
-    "start": "node dist/mcp-server.js",
+    "start": "node dist/cli.js",
     "dev": "tsc -w"
   },
   "dependencies": {
@@ -18,6 +21,7 @@
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
-    "@types/node": "^25.5.0"
+    "@types/node": "^25.5.0",
+    "typescript": "^5.7.2"
   }
 }

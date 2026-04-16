@@ -18,14 +18,16 @@ import {
 } from "viem";
 import { base } from "viem/chains";
 
-// --- CONFIG & PATHS (Unchanged) ---
+// --- CONFIG & PATHS ---
 const CONFIG_DIR = path.join(os.homedir(), ".aegis");
 const IDENTITY_PATH = path.join(CONFIG_DIR, "identity.json");
 
-const AEGIS_API_URL =
-  process.env.AEGIS_LOCAL_DEV === "true"
-    ? "http://localhost:3000/api/parse"
-    : "https://aegis-parse-production.up.railway.app/api/parse";
+// 🔥 UPDATED: Now points to the Unified Router Execute endpoint
+const AEGIS_ROUTER_URL =
+  process.env.AEGIS_ROUTER_URL ||
+  "https://aegis-router-production.up.railway.app";
+const AEGIS_EXECUTE_ENDPOINT = `${AEGIS_ROUTER_URL.replace(/\/$/, "")}/v1/execute`;
+
 const AEGIS_ENTERPRISE_WALLET = "0xDb11E8ba517ecB97C30a77b34C6492d2e15FD510";
 
 const RPC_URL = process.env.BASE_RPC_URL;
@@ -34,9 +36,8 @@ const publicClient = createPublicClient({
   transport: http(RPC_URL),
 });
 
-// --- IDENTITY MANAGEMENT ---
+// --- IDENTITY MANAGEMENT (Unchanged) ---
 function getOrCreateIdentity() {
-  // 🔥 1. Check for Env Var Override first (For Production / Docker)
   if (process.env.AEGIS_PRIVATE_KEY) {
     try {
       let pk = process.env.AEGIS_PRIVATE_KEY;
@@ -55,7 +56,6 @@ function getOrCreateIdentity() {
     }
   }
 
-  // 2. Fallback to physical file logic for local development
   if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
 
   if (existsSync(IDENTITY_PATH)) {
@@ -140,7 +140,6 @@ async function checkAndSweepFunds() {
             : { gasPrice }),
         });
 
-        // Only try to save the hash to disk if we are NOT using the env var override
         if (!process.env.AEGIS_PRIVATE_KEY && existsSync(IDENTITY_PATH)) {
           const fileContent = await fsPromises.readFile(IDENTITY_PATH, "utf-8");
           const identityData = JSON.parse(fileContent);
@@ -163,8 +162,8 @@ async function checkAndSweepFunds() {
   });
 }
 
-// 🔥 SHARED CORE ENGINE
-async function executeScrapeRequest(url: string) {
+// 🔥 UPDATED: SHARED CORE ENGINE (Universal Envelope Proxy)
+async function executeAegisRequest(service: string, requestPayload: any) {
   let currentHash;
   try {
     currentHash = await checkAndSweepFunds();
@@ -182,7 +181,7 @@ async function executeScrapeRequest(url: string) {
   const message = `Aegis Parse Auth: ${currentHash}:${timestamp}`;
   const signature = await userAccount.signMessage({ message });
 
-  const response = await fetch(AEGIS_API_URL, {
+  const response = await fetch(AEGIS_EXECUTE_ENDPOINT, {
     method: "POST",
     headers: {
       "x-payment-token": currentHash,
@@ -190,8 +189,9 @@ async function executeScrapeRequest(url: string) {
       "x-timestamp": timestamp,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ url }),
-    signal: AbortSignal.timeout(45000),
+    // We now wrap everything in the unified execution envelope
+    body: JSON.stringify({ service, request: requestPayload }),
+    signal: AbortSignal.timeout(120000), // Extended for LLM responses
   });
 
   if (response.status === 402) {
@@ -202,7 +202,7 @@ async function executeScrapeRequest(url: string) {
 
   if (!response.ok) {
     throw new Error(
-      `API_ERROR: Target site timed out or WAF blocked (Status ${response.status})`,
+      `API_ERROR: Upstream request failed (Status ${response.status})`,
     );
   }
 
@@ -211,7 +211,7 @@ async function executeScrapeRequest(url: string) {
 
 // --- MODE 1: MCP SERVER LOGIC ---
 async function startMcpServer() {
-  const server = new McpServer({ name: "Aegis Parse", version: "1.0.0" });
+  const server = new McpServer({ name: "Aegis Network", version: "1.0.0" });
 
   server.tool(
     "aegis_scrape",
@@ -219,11 +219,12 @@ async function startMcpServer() {
     { url: z.string().url() },
     async ({ url }) => {
       try {
-        const responseData = await executeScrapeRequest(url);
-        const { data, metadata } = responseData;
+        // Updated to use the new execution envelope
+        const responseData = await executeAegisRequest("aegis-parse", { url });
+        const { data, aegis_billing } = responseData;
         const title = data?.title || "Untitled Page";
         const markdown = data?.content || "No content extracted.";
-        const balance = metadata?.credit_balance ?? "Unknown";
+        const balance = aegis_billing?.credit_balance ?? "Unknown";
 
         return {
           content: [
@@ -256,18 +257,21 @@ async function startDaemonServer(port: number) {
   app.use(cors());
   app.use(express.json());
 
-  app.post("/v1/extract", async (req, res) => {
-    const { url } = req.body;
+  // 🔥 UPDATED: Now exposes the unified /v1/execute route locally
+  app.post("/v1/execute", async (req, res) => {
+    const { service, request } = req.body;
 
-    if (!url) {
-      return res.status(400).json({ error: "Missing 'url' in request body." });
+    if (!service || !request) {
+      return res
+        .status(400)
+        .json({ error: "Missing 'service' or 'request' in body envelope." });
     }
 
     try {
-      const responseData = await executeScrapeRequest(url);
+      const responseData = await executeAegisRequest(service, request);
       res.status(200).json(responseData);
     } catch (error: any) {
-      console.error(`[Daemon] Error scraping ${url}:`, error.message);
+      console.error(`[Daemon] Error executing ${service}:`, error.message);
 
       let status = 500;
       if (
@@ -285,14 +289,13 @@ async function startDaemonServer(port: number) {
     console.error(`🚀 Aegis Local Daemon Live on http://localhost:${port}`);
     console.error(`📫 Deposit Wallet: ${userAccount.address}`);
     console.error(
-      `💡 Bot Usage: POST http://localhost:${port}/v1/extract { "url": "..." }`,
+      `💡 Bot Usage: POST http://localhost:${port}/v1/execute { "service": "...", "request": {...} }`,
     );
   });
 }
 
 // --- THE ROUTER ---
 async function main() {
-  // Try to sweep on startup just in case funds arrived while offline
   try {
     await checkAndSweepFunds();
   } catch (e) {
@@ -300,12 +303,12 @@ async function main() {
   }
 
   const args = process.argv.slice(2);
-  const mode = args[0] || "mcp"; // Defaults to MCP if no arg is passed
+  // Support both "daemon" and "start" as aliases to start the server
+  const mode = args[0] || "mcp";
 
-  if (mode === "daemon") {
-    // Find --port flag, default to 8080
+  if (mode === "daemon" || mode === "start") {
     const portIndex = args.indexOf("--port");
-    const port = portIndex > -1 ? parseInt(args[portIndex + 1]) : 8080;
+    const port = portIndex > -1 ? parseInt(args[portIndex + 1]) : 23447;
     await startDaemonServer(port);
   } else {
     await startMcpServer();
