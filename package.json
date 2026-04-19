@@ -9,7 +9,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/cli.js",
-    "dev": "tsc -w"
+    "dev": "tsc -w",
+    "e2e": "tsx --env-file=.env test/e2e.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.3",
@@ -22,6 +23,7 @@
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^25.5.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.7.2"
   }
 }

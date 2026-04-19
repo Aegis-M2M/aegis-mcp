@@ -31,7 +31,13 @@ const ERC20_ABI = [
     },
 ];
 // --- CONFIG & PATHS ---
-const CONFIG_DIR = path.join(os.homedir(), ".aegis");
+// AEGIS_HOME overrides the default ~/.aegis location. Used by the E2E test
+// harness to sandbox each daemon into a throwaway directory, but also handy
+// for multi-tenant setups where a single machine runs several daemons under
+// different identities.
+const CONFIG_DIR = process.env.AEGIS_HOME
+    ? path.resolve(process.env.AEGIS_HOME)
+    : path.join(os.homedir(), ".aegis");
 const IDENTITY_PATH = path.join(CONFIG_DIR, "identity.json");
 const SERVICES_PATH = path.join(CONFIG_DIR, "services.json");
 const AEGIS_ROUTER_URL = process.env.AEGIS_ROUTER_URL ||
@@ -124,6 +130,23 @@ const walletClient = createWalletClient({
     chain: base,
     transport: http(RPC_URL),
 });
+// --- Aegis signed-request helper ---
+//
+// The Router authenticates every privileged call (register, update, claim)
+// by recovering the signer from `x-signature` and comparing it to the
+// service's `provider_wallet`. We sign every such outbound request with
+// the Transit Wallet so the router can perform that check without any
+// shared secret crossing the wire.
+async function signAegisRequestHeaders() {
+    const timestamp = Date.now().toString();
+    const message = `Aegis Auth: ${userAccount.address}:${timestamp}`;
+    const signature = await userAccount.signMessage({ message });
+    return {
+        "x-wallet-address": userAccount.address,
+        "x-signature": signature,
+        "x-timestamp": timestamp,
+    };
+}
 // --- USDC PERMIT (EIP-2612 Gasless Deposit) ---
 let sweepLockChain = Promise.resolve();
 function withSweepLock(fn) {
@@ -238,7 +261,7 @@ function updateCall(id, patch) {
     callFeed[idx] = { ...callFeed[idx], ...patch };
 }
 // --- SHARED CORE ENGINE (Execution Envelope) ---
-async function executeAegisRequest(service, requestPayload) {
+async function executeAegisRequest(service, requestPayload, maxCredits) {
     const callId = randomUUID();
     const started = Date.now();
     pushCall({
@@ -262,6 +285,10 @@ async function executeAegisRequest(service, requestPayload) {
     const message = `Aegis Auth: ${userAccount.address}:${timestamp}`;
     const signature = await userAccount.signMessage({ message });
     try {
+        // `x-max-credits` is only meaningful for DYNAMIC services; the router
+        // ignores it on FIXED pricing (contract price wins). We still forward
+        // it when set so operators can enforce a cap on mixed-pricing agents
+        // without branching on pricing_type at the call site.
         const response = await fetch(AEGIS_EXECUTE_ENDPOINT, {
             method: "POST",
             headers: {
@@ -269,6 +296,9 @@ async function executeAegisRequest(service, requestPayload) {
                 "x-signature": signature,
                 "x-timestamp": timestamp,
                 "Content-Type": "application/json",
+                ...(typeof maxCredits === "number"
+                    ? { "x-max-credits": String(maxCredits) }
+                    : {}),
             },
             body: JSON.stringify({ service, request: requestPayload }),
             signal: AbortSignal.timeout(120_000),
@@ -454,15 +484,20 @@ async function startDaemonServer(port) {
     // ══════════════════════════════════════════════════════════════════
     //  Provider Portal endpoints
     // ══════════════════════════════════════════════════════════════════
-    // Atomic Claim & Register:
+    // Atomic Test & Register:
     //   1. POST sample_request to the provider's own endpoint_url using
     //      their secret as a Bearer token. If that fails, STOP — we never
     //      touch the global registry with a broken configuration.
-    //   2. On local success, register with the Aegis Router.
-    //   3. On registry success, persist the plaintext secret locally so
-    //      the owner can later claim payouts from this machine.
+    //   2. Probe the Router for an existing registration under this id so
+    //      we know whether to POST (create) or PUT (update). This also lets
+    //      us surface an early 403 before asking the router to do anything.
+    //   3. Send the signed request. Every call to the registry is signed by
+    //      the Transit Wallet (identity.json), which the router treats as
+    //      the sole owner of this service.
+    //   4. On success, persist a local record so the dashboard can show
+    //      "this daemon controls this service".
     app.post("/api/provider/register", async (req, res) => {
-        const { id, endpoint_url, payout_wallet, pricing_type, fixed_cost, secret, sample_request, } = req.body ?? {};
+        const { id, endpoint_url, pricing_type, fixed_cost, secret, sample_request } = req.body ?? {};
         if (typeof id !== "string" || !SERVICE_ID_RE.test(id)) {
             return res.status(400).json({
                 error: "INVALID_ID",
@@ -473,12 +508,6 @@ async function startDaemonServer(port) {
             return res.status(400).json({
                 error: "INVALID_ENDPOINT_URL",
                 message: "endpoint_url must be an absolute http(s) URL.",
-            });
-        }
-        if (typeof payout_wallet !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(payout_wallet)) {
-            return res.status(400).json({
-                error: "INVALID_PAYOUT_WALLET",
-                message: "payout_wallet must be a 0x-prefixed 40-char EVM address.",
             });
         }
         if (pricing_type !== "FIXED" && pricing_type !== "DYNAMIC") {
@@ -514,51 +543,117 @@ async function startDaemonServer(port) {
                 message: "sample_request must be a JSON object.",
             });
         }
-        // ── Step 1: The Test ─────────────────────────────────────────
-        let localResponse;
+        // Ownership is tied to the Transit Wallet. The dashboard no longer lets
+        // the user pick a separate payout wallet — whoever signs with this
+        // identity.json *is* the provider wallet.
+        const providerWallet = userAccount.address;
+        // ── Step 1: Probe for an existing registration ───────────────
+        // Determines POST (create) vs PUT (update) up front so we can apply
+        // the right policy to the local test below: creation must prove the
+        // endpoint actually works, but updates are authorised by ownership
+        // alone — the operator may legitimately be rotating a secret,
+        // pointing at a stub, or parking the service on a 5xx while
+        // maintenance is ongoing. Running the local test on updates would
+        // turn that into a rug pull for the owner.
+        let method = "POST";
         try {
-            localResponse = await fetch(endpoint_url, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    Authorization: `Bearer ${secret}`,
-                },
-                body: JSON.stringify(sample_request),
-                signal: AbortSignal.timeout(15_000),
+            const probe = await fetch(AEGIS_REGISTRY_STATS_ENDPOINT(id), {
+                signal: AbortSignal.timeout(8_000),
             });
+            if (probe.ok) {
+                const stats = await probe.json().catch(() => ({}));
+                const existingOwner = stats?.service?.provider_wallet;
+                if (typeof existingOwner === "string" &&
+                    existingOwner.toLowerCase() !== providerWallet.toLowerCase()) {
+                    return res.status(403).json({
+                        error: "NOT_OWNER",
+                        stage: "ownership_check",
+                        message: "This service id is owned by another wallet. Pick a new id, or run the daemon with the identity that owns it.",
+                        owner: existingOwner,
+                        signer: providerWallet,
+                    });
+                }
+                method = "PUT";
+            }
+            else if (probe.status !== 404) {
+                // Any non-404 non-200 is a router problem — surface it rather
+                // than silently attempting a POST.
+                const body = await probe.json().catch(() => ({}));
+                return res.status(502).json({
+                    error: "ROUTER_PROBE_FAILED",
+                    stage: "ownership_check",
+                    message: body?.message ?? `Router returned ${probe.status} during probe.`,
+                });
+            }
         }
         catch (err) {
-            return res.status(400).json({
-                error: "LOCAL_UNREACHABLE",
-                stage: "local_test",
-                message: `Could not reach ${endpoint_url}: ${err?.message ?? err}`,
+            return res.status(502).json({
+                error: "ROUTER_UNREACHABLE",
+                stage: "ownership_check",
+                message: `Could not reach Aegis Router: ${err?.message ?? err}`,
             });
         }
-        // ── Step 2: The Halt ─────────────────────────────────────────
-        if (!localResponse.ok) {
-            const bodyText = await localResponse.text().catch(() => "");
-            return res.status(400).json({
-                error: "LOCAL_TEST_FAILED",
-                stage: "local_test",
-                upstream_status: localResponse.status,
-                message: `Your endpoint returned ${localResponse.status}. Fix it before registering.`,
-                upstream_body: bodyText.slice(0, 2_000),
-            });
+        // ── Step 2: The Local Test (creation only) ───────────────────
+        // Skipped for PUT — see rationale on Step 1.
+        if (method === "POST") {
+            let localResponse;
+            try {
+                localResponse = await fetch(endpoint_url, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        Authorization: `Bearer ${secret}`,
+                    },
+                    body: JSON.stringify(sample_request),
+                    signal: AbortSignal.timeout(15_000),
+                });
+            }
+            catch (err) {
+                return res.status(400).json({
+                    error: "LOCAL_UNREACHABLE",
+                    stage: "local_test",
+                    message: `Could not reach ${endpoint_url}: ${err?.message ?? err}`,
+                });
+            }
+            if (!localResponse.ok) {
+                const bodyText = await localResponse.text().catch(() => "");
+                return res.status(400).json({
+                    error: "LOCAL_TEST_FAILED",
+                    stage: "local_test",
+                    upstream_status: localResponse.status,
+                    message: `Your endpoint returned ${localResponse.status}. Fix it before registering.`,
+                    upstream_body: bodyText.slice(0, 2_000),
+                });
+            }
         }
-        // ── Step 3: The Sync ─────────────────────────────────────────
+        // ── Step 3: Send the signed request ──────────────────────────
+        // The POST body carries the new-creation fields; the PUT body uses
+        // `new_secret` for the rotation field name the router expects on
+        // updates. We never send a `current_secret` — the signature is the
+        // proof of ownership.
+        const payload = method === "POST"
+            ? {
+                id,
+                provider_wallet: providerWallet,
+                endpoint_url,
+                pricing_type,
+                fixed_cost: normalizedFixedCost,
+                provider_secret: secret,
+            }
+            : {
+                id,
+                endpoint_url,
+                new_secret: secret,
+            };
         let routerResponse;
         try {
             routerResponse = await fetch(AEGIS_REGISTER_ENDPOINT, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    id,
-                    provider_wallet: payout_wallet,
-                    endpoint_url,
-                    pricing_type,
-                    fixed_cost: normalizedFixedCost,
-                    provider_secret: secret,
-                }),
+                method,
+                headers: {
+                    "Content-Type": "application/json",
+                    ...(await signAegisRequestHeaders()),
+                },
+                body: JSON.stringify(payload),
                 signal: AbortSignal.timeout(30_000),
             });
         }
@@ -578,7 +673,10 @@ async function startDaemonServer(port) {
                 router_body: routerBody,
             });
         }
-        // ── Step 4: The Persist ──────────────────────────────────────
+        // ── Step 4: Persist locally ──────────────────────────────────
+        // We still keep the provider secret on disk so the operator can
+        // re-run sample tests or rotate the bearer token later. Router
+        // auth no longer depends on it.
         try {
             const services = loadServices();
             services[id] = {
@@ -586,7 +684,7 @@ async function startDaemonServer(port) {
                 endpoint_url,
                 pricing_type,
                 fixed_cost: normalizedFixedCost,
-                payout_wallet,
+                payout_wallet: providerWallet,
                 registered_at: new Date().toISOString(),
             };
             saveServices(services);
@@ -596,22 +694,27 @@ async function startDaemonServer(port) {
             return res.status(500).json({
                 error: "PERSIST_FAILED",
                 stage: "persist",
-                message: "Registered on the router, but failed to save the secret locally.",
+                message: "Registered on the router, but failed to save the service locally.",
             });
         }
         return res.status(200).json({
             ok: true,
             stage: "complete",
+            method,
             service: routerBody?.service ?? {
                 id,
-                provider_wallet: payout_wallet,
+                provider_wallet: providerWallet,
                 endpoint_url,
                 pricing_type,
                 fixed_cost: normalizedFixedCost,
             },
-            updated: !!routerBody?.updated,
+            updated: method === "PUT" || !!routerBody?.updated,
         });
     });
+    // Claims are authorised by the Transit Wallet signature. The daemon no
+    // longer needs the plaintext provider secret to prove it owns the
+    // service — the router recovers `x-wallet-address` from `x-signature`
+    // and compares it to the service's `provider_wallet`.
     app.post("/api/provider/claim", async (req, res) => {
         const { id } = req.body ?? {};
         if (typeof id !== "string" || !SERVICE_ID_RE.test(id)) {
@@ -620,20 +723,15 @@ async function startDaemonServer(port) {
                 message: "id must match the service id format.",
             });
         }
-        const services = loadServices();
-        const entry = services[id];
-        if (!entry || !entry.secret) {
-            return res.status(404).json({
-                error: "SECRET_NOT_FOUND",
-                message: `No locally stored secret for service "${id}". Register it here first.`,
-            });
-        }
         let routerResponse;
         try {
             routerResponse = await fetch(AEGIS_PAYOUT_CLAIM_ENDPOINT, {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ id, provider_secret: entry.secret }),
+                headers: {
+                    "Content-Type": "application/json",
+                    ...(await signAegisRequestHeaders()),
+                },
+                body: JSON.stringify({ id }),
                 signal: AbortSignal.timeout(120_000),
             });
         }
@@ -646,7 +744,13 @@ async function startDaemonServer(port) {
         const body = await routerResponse.json().catch(() => ({}));
         return res.status(routerResponse.status).json(body);
     });
-    // Proxy provider stats so the dashboard can stay same-origin.
+    // Proxy provider stats so the dashboard can stay same-origin. We
+    // augment the payload with two local-only signals so the UI can make
+    // decisions without a second round-trip:
+    //   • local_registered — id appears in services.json on this daemon.
+    //   • is_owner         — the service's provider_wallet matches this
+    //                        daemon's Transit Wallet, i.e. we can sign a
+    //                        claim on its behalf.
     app.get("/api/provider/stats/:id", async (req, res) => {
         const { id } = req.params;
         if (!SERVICE_ID_RE.test(id)) {
@@ -658,9 +762,14 @@ async function startDaemonServer(port) {
             });
             const body = await r.json().catch(() => ({}));
             const services = loadServices();
+            const ownerOnRouter = body?.service?.provider_wallet;
+            const isOwner = typeof ownerOnRouter === "string" &&
+                ownerOnRouter.toLowerCase() === userAccount.address.toLowerCase();
             return res.status(r.status).json({
                 ...body,
                 local_registered: !!services[id],
+                is_owner: isOwner,
+                signer_wallet: userAccount.address,
             });
         }
         catch (err) {
@@ -671,14 +780,56 @@ async function startDaemonServer(port) {
         }
     });
     app.post("/v1/execute", async (req, res) => {
-        const { service, request } = req.body;
+        const { service, request, maxCredits } = req.body ?? {};
         if (!service || !request) {
             return res
                 .status(400)
                 .json({ error: "Missing 'service' or 'request' in body envelope." });
         }
+        // Optional consumer-side spend cap. The router honours this as
+        // `x-max-credits` only for DYNAMIC pricing; for FIXED services we
+        // must enforce it locally because the router will happily charge the
+        // contract price regardless. Enforcing on the daemon catches the
+        // mismatch *before* the provider is even contacted — which is what
+        // the user expects when they set a cap.
+        let maxCreditsNum;
+        if (maxCredits !== undefined && maxCredits !== null) {
+            const parsed = Number(maxCredits);
+            if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+                return res.status(400).json({
+                    error: "INVALID_MAX_CREDITS",
+                    message: "`maxCredits` must be a positive integer when provided.",
+                });
+            }
+            maxCreditsNum = parsed;
+            // Pre-flight: probe the service's contract. A probe failure is not
+            // fatal — we fall through and let the router/pricing-layer decide.
+            try {
+                const probe = await fetch(AEGIS_REGISTRY_STATS_ENDPOINT(service), {
+                    signal: AbortSignal.timeout(5_000),
+                });
+                if (probe.ok) {
+                    const stats = await probe.json().catch(() => ({}));
+                    const pt = stats?.service?.pricing_type;
+                    const fc = stats?.service?.fixed_cost;
+                    if (pt === "FIXED" &&
+                        typeof fc === "number" &&
+                        fc > maxCreditsNum) {
+                        return res.status(402).json({
+                            error: "MAX_CREDITS_TOO_LOW",
+                            message: `Service "${service}" requires ${fc} credits; caller's maxCredits cap is ${maxCreditsNum}.`,
+                            required: fc,
+                            maxCredits: maxCreditsNum,
+                        });
+                    }
+                }
+            }
+            catch {
+                // Probe failed; skip the pre-check and fall through.
+            }
+        }
         try {
-            const responseData = await executeAegisRequest(service, request);
+            const responseData = await executeAegisRequest(service, request, maxCreditsNum);
             res.status(200).json(responseData);
         }
         catch (error) {
@@ -699,6 +850,21 @@ async function startDaemonServer(port) {
     });
     // Warm the balance cache so the first dashboard load is instant.
     fetchBalance(true).catch(() => undefined);
+    // Background sweep poll. Without this, USDC deposited *after* startup
+    // would sit idle until the user made an execute call. A cheap chain
+    // read every few seconds keeps the transit wallet drained into credits
+    // the moment funds land — which is what the dashboard/e2e flow expects.
+    // Tunable via AEGIS_SWEEP_INTERVAL_MS; set to 0 to disable.
+    const sweepIntervalMs = Number(process.env.AEGIS_SWEEP_INTERVAL_MS ?? 8_000);
+    if (Number.isFinite(sweepIntervalMs) && sweepIntervalMs > 0) {
+        const sweepTimer = setInterval(() => {
+            checkAndSweepFunds().catch((err) => {
+                console.error("[Aegis] ⚠️ Background sweep failed:", err?.message ?? err);
+            });
+        }, sweepIntervalMs);
+        // Unref so the timer never blocks process exit (e.g. SIGTERM teardown).
+        sweepTimer.unref?.();
+    }
 }
 // --- THE ROUTER ---
 async function main() {

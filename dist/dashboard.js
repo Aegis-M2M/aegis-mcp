@@ -602,6 +602,14 @@ export const DASHBOARD_HTML = /* html */ `<!doctype html>
     <section class="panel" id="panel-provider" role="tabpanel" hidden>
       <div class="card" style="margin-bottom: 18px;">
         <h2>Register a Service</h2>
+        <div class="hint" style="margin-bottom: 14px;">
+          <span class="chain-badge">● Owner</span>
+          Your local Aegis Wallet (<code>~/.aegis/identity.json</code>) is the
+          master key for every service you register from this daemon. The
+          router verifies ownership by recovering this address from a
+          request signature — there is no password to remember or rotate.
+          Back up <code>identity.json</code> to keep control of payouts.
+        </div>
         <form id="provider-form" autocomplete="off">
           <div class="form-grid">
             <div class="field">
@@ -614,10 +622,10 @@ export const DASHBOARD_HTML = /* html */ `<!doctype html>
               <input id="f-endpoint" name="endpoint_url" type="text" placeholder="https://api.example.com/run" spellcheck="false" required />
               <span class="help">We POST the sample request here with your secret.</span>
             </div>
-            <div class="field">
-              <label for="f-wallet">Payout Wallet</label>
-              <input id="f-wallet" name="payout_wallet" type="text" placeholder="0x…" spellcheck="false" required />
-              <span class="help">EVM address (Base network) that receives claims.</span>
+            <div class="field full">
+              <label for="f-owner">Owner &amp; Payout Wallet</label>
+              <input id="f-owner" type="text" readonly tabindex="-1" placeholder="—" spellcheck="false" />
+              <span class="help">Auto-filled from <code>identity.json</code>. Signs every registry call and receives USDC on claim.</span>
             </div>
             <div class="field">
               <label for="f-pricing">Pricing</label>
@@ -632,10 +640,10 @@ export const DASHBOARD_HTML = /* html */ `<!doctype html>
               <input id="f-cost" name="fixed_cost" type="number" min="1" step="1" placeholder="e.g. 250" />
               <span class="help">100 credits = $0.01 USD.</span>
             </div>
-            <div class="field">
-              <label for="f-secret">Provider Secret</label>
-              <input id="f-secret" name="secret" type="password" placeholder="Bearer token" spellcheck="false" required />
-              <span class="help">Sent as <code>Authorization: Bearer</code>. Stored encrypted.</span>
+            <div class="field full">
+              <label for="f-secret">Provider Secret (Bearer token)</label>
+              <input id="f-secret" name="secret" type="password" placeholder="Bearer token your endpoint expects" spellcheck="false" required />
+              <span class="help">Sent as <code>Authorization: Bearer</code> to your endpoint. Stored encrypted on the router. Not used to authenticate you to Aegis — your wallet does that.</span>
             </div>
             <div class="field full">
               <label for="f-sample">Sample Request (JSON)</label>
@@ -645,7 +653,7 @@ export const DASHBOARD_HTML = /* html */ `<!doctype html>
           </div>
           <div class="form-actions">
             <button id="register-btn" class="btn primary" type="submit">Test &amp; Register</button>
-            <span id="register-status" class="form-status">Fill out the form, then press Register. We test your endpoint before registering.</span>
+            <span id="register-status" class="form-status">Fill out the form, then press Register. We test your endpoint before touching the on-chain registry.</span>
           </div>
         </form>
       </div>
@@ -875,12 +883,11 @@ export const DASHBOARD_HTML = /* html */ `<!doctype html>
 
       const id = $("f-id").value.trim();
       const endpoint_url = $("f-endpoint").value.trim();
-      const payout_wallet = $("f-wallet").value.trim();
       const pricing_type = pricingEl.value;
       const secret = $("f-secret").value;
       const rawSample = $("f-sample").value;
 
-      if (!id || !endpoint_url || !payout_wallet || !secret) {
+      if (!id || !endpoint_url || !secret) {
         setStatus($("register-status"), "err", "Fill in every field.");
         return;
       }
@@ -918,7 +925,6 @@ export const DASHBOARD_HTML = /* html */ `<!doctype html>
           body: safeStringify({
             id,
             endpoint_url,
-            payout_wallet,
             pricing_type,
             fixed_cost,
             secret,
@@ -934,10 +940,11 @@ export const DASHBOARD_HTML = /* html */ `<!doctype html>
           return;
         }
 
+        const verb = body.method === "PUT" || body.updated ? "Updated" : "Registered";
         setStatus(
           $("register-status"),
           "ok",
-          "✓ Registered " + id + (body.updated ? " (updated)" : "") + ". Earnings card is now live."
+          "✓ " + verb + " " + id + " as owner. Earnings card is now live."
         );
         lastStatsId = id;
         pollProviderStats(true);
@@ -1012,11 +1019,21 @@ export const DASHBOARD_HTML = /* html */ `<!doctype html>
         $("earn-total").textContent = fmtNum(total);
         $("earn-total-usd").textContent = fmtUsd(creditsToUsd(total));
 
-        const canClaim = !!body.local_registered && pending > MIN_CLAIM_CREDITS;
+        // Authority to claim is purely cryptographic now: this daemon can
+        // sweep funds if and only if its Transit Wallet matches the
+        // service's provider_wallet on the router. local_registered is
+        // just a UX breadcrumb; is_owner is the source of truth.
+        const isOwner = !!body.is_owner;
+        const canClaim = isOwner && pending > MIN_CLAIM_CREDITS;
         claimBtn.disabled = busyState.claim || !canClaim;
 
-        if (!body.local_registered) {
-          setStatus($("claim-status"), "", "Service is registered on the router, but this daemon doesn't hold its secret. Re-register here to enable claiming.");
+        if (!isOwner) {
+          const actual = (body && body.service && body.service.provider_wallet) || "another wallet";
+          setStatus(
+            $("claim-status"),
+            "",
+            "This service is owned by " + actual + ". Run the daemon with that identity.json to claim."
+          );
         } else if (pending <= MIN_CLAIM_CREDITS) {
           const need = MIN_CLAIM_CREDITS - pending;
           setStatus($("claim-status"), "", "Need " + fmtNum(need + 1) + " more credits to claim (" + fmtUsd(creditsToUsd(need + 1)) + ").");
@@ -1085,6 +1102,9 @@ export const DASHBOARD_HTML = /* html */ `<!doctype html>
         );
 
         $("wallet-addr").textContent = s.wallet || "—";
+        // Provider form: owner field is readonly and always mirrors the
+        // Transit Wallet — whoever signs is who owns.
+        safeSetValue($("f-owner"), s.wallet || "");
 
         if (s.credits == null) {
           $("balance-num").textContent = "—";
