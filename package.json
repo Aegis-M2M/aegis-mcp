@@ -7,5 +7,8 @@
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "e2e": "npm run e2e -w @aegis-m2m/cli"
+  },
+  "dependencies": {
+    "@composio/core": "^0.6.11"
   }
 }

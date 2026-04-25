@@ -16,6 +16,8 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { DASHBOARD_HTML } from "./dashboard.js";
+import { z } from "zod";
+import { Composio } from "@composio/core";
 
 // --- CONFIG & PATHS ---
 const CONFIG_DIR = process.env.AEGIS_HOME
@@ -25,6 +27,7 @@ const IDENTITY_PATH = path.join(CONFIG_DIR, "identity.json");
 const SERVICES_PATH = path.join(CONFIG_DIR, "services.json");
 const BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as const;
 const AEGIS_ENTERPRISE_WALLET = "0xDb11E8ba517ecB97C30a77b34C6492d2e15FD510";
+const AEGIS_USER_ID = process.env.AEGIS_USER_ID || "default";
 
 const AEGIS_ROUTER_URL =
   process.env.AEGIS_ROUTER_URL ||
@@ -33,13 +36,110 @@ const AEGIS_ROUTER_BASE = AEGIS_ROUTER_URL.replace(/\/$/, "");
 const AEGIS_EXECUTE_ENDPOINT = `${AEGIS_ROUTER_BASE}/v1/execute`;
 const AEGIS_FUND_ENDPOINT = `${AEGIS_ROUTER_BASE}/v1/fund`;
 const AEGIS_REGISTER_ENDPOINT = `${AEGIS_ROUTER_BASE}/v1/register`;
-const AEGIS_PAYOUT_CLAIM_ENDPOINT = `${AEGIS_ROUTER_BASE}/v1/payout/claim`;
 const AEGIS_REGISTRY_STATS_ENDPOINT = (id: string) =>
   `${AEGIS_ROUTER_BASE}/v1/register/stats/${encodeURIComponent(id)}`;
 const AEGIS_BALANCE_ENDPOINT = (wallet: string) =>
   `${AEGIS_ROUTER_BASE}/v1/balance/${wallet}`;
 
 const SERVICE_ID_RE = /^[a-z0-9][a-z0-9_-]{1,63}$/i;
+
+// --- COMPOSIO DIRECT INTEGRATION ---
+const composio = new Composio({
+  apiKey: process.env.COMPOSIO_API_KEY,
+});
+
+/**
+ * Transforms Composio tool metadata into MCP-compatible Tool objects.
+ */
+function transformComposioToMcp(toolMeta: any) {
+  // Account for different SDK metadata shapes
+  const params =
+    toolMeta.parameters || toolMeta.schema || toolMeta.expected_schema || {};
+  return {
+    name: (toolMeta.slug || toolMeta.name).toLowerCase(),
+    description:
+      toolMeta.description || `Execute ${toolMeta.name} via Composio`,
+    inputSchema: {
+      type: "object",
+      properties: params.properties || {},
+      required: params.required || [],
+      additionalProperties: false,
+    },
+  };
+}
+
+const AegisActionsInputSchema = z.object({
+  action: z.string().min(1),
+  params: z.record(z.string(), z.unknown()).default({}),
+  user_id: z.string().min(1),
+});
+
+function inferToolkitSlug(action: string): string | null {
+  const prefix = action.split("_")[0]?.trim();
+  if (!prefix) return null;
+  const slug = prefix.toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(slug)) return null;
+  return slug;
+}
+
+async function composioHasActiveConnection(
+  userId: string,
+  toolkitSlug: string,
+): Promise<boolean> {
+  const resp: any = await composio.connectedAccounts.list({
+    userIds: [userId],
+    toolkitSlugs: [toolkitSlug],
+    statuses: ["ACTIVE"],
+  });
+  const items = Array.isArray(resp?.items) ? resp.items : [];
+  return items.length > 0;
+}
+
+async function composioCreateConnectionRequestLink(
+  userId: string,
+  toolkitSlug: string,
+): Promise<string> {
+  const request: any = await composio.toolkits.authorize(userId, toolkitSlug);
+  const redirectUrl = request?.redirectUrl;
+  if (typeof redirectUrl !== "string" || redirectUrl.length === 0) {
+    throw new Error("Composio did not return a redirectUrl for authorization.");
+  }
+  return redirectUrl;
+}
+
+/**
+ * DIRECT SDK EXECUTION
+ * Replaces the unreliable forwardToComposioProxy.
+ */
+async function executeComposioActionDirect(
+  userId: string,
+  action: string,
+  params: any,
+) {
+  if (!process.env.COMPOSIO_API_KEY) {
+    throw new Error("COMPOSIO_API_KEY is not set.");
+  }
+
+  console.error(`\n[COMPOSIO EXECUTE] 🚀 Action: ${action} | User: ${userId}`);
+  console.error(`Params: ${JSON.stringify(params)}`);
+
+  try {
+    const result = await composio.tools.execute(action, {
+      userId,
+      arguments: params ?? {},
+      dangerouslySkipVersionCheck: true,
+    });
+
+    console.error(`[COMPOSIO SUCCESS] ✅ Result received.`);
+    return result;
+  } catch (err: any) {
+    console.error(`[COMPOSIO ERROR] ❌ SDK Crash:`, err.message);
+    if (err.cause) console.error(`[CAUSE]:`, err.cause);
+    throw err;
+  }
+}
+
+// --- VIEM & WEB3 ---
 const ERC20_ABI = [
   {
     name: "balanceOf",
@@ -75,6 +175,13 @@ function loadServices() {
 function saveServices(data: any) {
   if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
   writeFileSync(SERVICES_PATH, JSON.stringify(data, null, 2), { mode: 0o600 });
+}
+
+function ensureBuiltinServices(): void {
+  // Intentionally no longer injects any static Composio/Aegis "actions" tool.
+  // The MCP server dynamically discovers Composio actions at runtime.
+  if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+  if (!existsSync(SERVICES_PATH)) saveServices({});
 }
 
 function getOrCreateIdentity() {
@@ -230,19 +337,16 @@ async function executeAegisRequest(
   return data;
 }
 
-// New function to handle the streaming flow
 async function executeAegisStream(
   service: string,
   request: any,
   res: express.Response,
 ) {
-  // 1. SEND HEADERS IMMEDIATELY
-  // Don't wait for the Router to answer. Tell LibreChat right now that a stream is coming.
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
-  res.flushHeaders(); // Force the headers out the door
+  res.flushHeaders();
 
   const headers: Record<string, string> = {
     ...(await signAegisRequestHeaders()),
@@ -272,7 +376,7 @@ async function executeAegisStream(
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      res.write(value); // This value is already 'data: {...}\n\n'
+      res.write(value);
     }
   } catch (err: any) {
     console.error("Stream pipe failed:", err.message);
@@ -292,9 +396,8 @@ type McpToolDescriptor = {
   inputSchema: Record<string, unknown>;
 };
 
-// 1. We ONLY store the transports globally so the POST route can find them.
-// NO GLOBAL mcpServer INSTANCE!
 const sseSessions = new Map<string, SSEServerTransport>();
+let mcpServerInstance: Server;
 
 function extractToolResult(serviceId: string, data: unknown): string {
   if (typeof data === "string") return data;
@@ -330,12 +433,9 @@ function extractToolResult(serviceId: string, data: unknown): string {
 function buildToolsFromServicesCatalog(): McpToolDescriptor[] {
   const services = loadServices();
   const tools: McpToolDescriptor[] = [];
-
-  // Prevent Claude from seeing the internal LLM routing services as tools
   const IGNORED_SERVICES = ["aegis-claude", "aegis-openai", "aegis-perplexity"];
 
   for (const [id, meta] of Object.entries(services) as [string, any][]) {
-    // 1. Skip invalid IDs or internal LLM proxies
     if (!SERVICE_ID_RE.test(id)) continue;
     if (IGNORED_SERVICES.includes(id)) continue;
 
@@ -355,7 +455,6 @@ function buildToolsFromServicesCatalog(): McpToolDescriptor[] {
       }
     }
 
-    // 2. Use the clean, original description
     tools.push({
       name: id,
       description:
@@ -368,61 +467,156 @@ function buildToolsFromServicesCatalog(): McpToolDescriptor[] {
   return tools;
 }
 
-// 2. THE FACTORY: This creates a fresh Brain for every single connection
 function createSessionMcpServer() {
   const server = new Server(
     { name: "Aegis Hub", version: "1.0.0" },
     { capabilities: { tools: { listChanged: true } } },
   );
+  mcpServerInstance = server;
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const tools = buildToolsFromServicesCatalog();
-
-    // Heartbeat Tool: Prevents LibreChat from panicking if it connects before proxies finish booting
-    tools.push({
-      name: "aegis_health_ping",
-      description: "Internal network heartbeat. Do not use.",
-      inputSchema: { type: "object" },
-    });
-
     return {
-      tools: tools.map((t) => ({
-        name: t.name,
-        description: t.description,
-        inputSchema: t.inputSchema as any,
-      })),
+      tools: [
+        {
+          name: "aegis_composio",
+          description:
+            "Primary gateway for 200+ 3rd-party apps including GitHub, Slack, Salesforce, Jira, Asana, HubSpot, Shopify, etc. Use this by default whenever the user asks to fetch or modify data in an external service, even if they don't explicitly ask for it. Workflow: use 'login' to authorize, 'explore' to discover available tools for an app, and 'execute' to run a specific tool.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              action: {
+                type: "string",
+                enum: ["login", "explore", "execute"],
+                description: "The operation to perform.",
+              },
+              app: {
+                type: "string",
+                description: "The app name (e.g., 'github').",
+              },
+              tool_name: {
+                type: "string",
+                description:
+                  "The specific Composio tool slug (Required for 'execute').",
+              },
+              tool_params: {
+                type: "object",
+                description:
+                  "Parameters for the tool (Required for 'execute').",
+              },
+            },
+            required: ["action", "app"],
+          },
+        },
+        {
+          name: "aegis_hub",
+          description: "Executes native Aegis microservices.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              service: {
+                type: "string",
+                description:
+                  "The Aegis service ID (e.g., 'aegis-search', 'aegis-parse').",
+              },
+              params: {
+                type: "object",
+                description: "Parameters for the service.",
+              },
+            },
+            required: ["service", "params"],
+          },
+        },
+      ],
     };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
-    const { name, arguments: args } = req.params;
-    if (name === "aegis_health_ping")
-      return { content: [{ type: "text" as const, text: "ok" }] };
+    const { name, arguments: args } = req.params as any;
+    const AEGIS_USER_ID = process.env.AEGIS_USER_ID || "default";
 
-    const catalog = loadServices();
-    if (
-      !SERVICE_ID_RE.test(name) ||
-      !Object.prototype.hasOwnProperty.call(catalog, name)
-    ) {
+    try {
+      // --- 1. COMPOSIO META-TOOL ---
+      if (name === "aegis_composio") {
+        const { action, app, tool_name, tool_params } = (args ?? {}) as any;
+
+        if (action === "login") {
+          const request: any = await composio.toolkits.authorize(
+            AEGIS_USER_ID,
+            app,
+          );
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Please login here: ${request.redirectUrl}`,
+              },
+            ],
+          };
+        }
+
+        if (action === "explore") {
+          console.error(`🔍 Exploring tools for app: ${app}`);
+          const rawTools = await (composio.tools as any).getRawComposioTools({
+            toolkits: [app],
+          });
+
+          // Return a lightweight summary to the LLM to save context
+          const toolSummary = rawTools.map((t: any) => ({
+            name: t.name || t.slug,
+            description: t.description,
+            schema: t.parameters || t.schema || t.expected_schema,
+          }));
+
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(toolSummary, null, 2) },
+            ],
+          };
+        }
+
+        if (action === "execute") {
+          if (!tool_name)
+            throw new Error("tool_name is required for execute action.");
+          const result = await executeComposioActionDirect(
+            AEGIS_USER_ID,
+            tool_name,
+            tool_params ?? {},
+          );
+          const text =
+            typeof result === "string"
+              ? result
+              : JSON.stringify(result, null, 2);
+          return { content: [{ type: "text", text }] };
+        }
+      }
+
+      // --- 2. AEGIS NATIVE META-TOOL ---
+      if (name === "aegis_hub") {
+        const { service, params } = (args ?? {}) as any;
+
+        const catalog = loadServices();
+        if (!catalog[service]) {
+          return {
+            content: [
+              { type: "text", text: `Unknown Aegis service: ${service}` },
+            ],
+            isError: true,
+          };
+        }
+
+        const raw = await executeAegisRequest(service, params ?? {});
+        const payload = (raw as any)?.data ?? raw;
+        const text = extractToolResult(service, payload);
+        return { content: [{ type: "text", text }] };
+      }
+
       return {
-        content: [
-          { type: "text" as const, text: `Unknown Aegis service: ${name}` },
-        ],
+        content: [{ type: "text", text: `Unknown meta-tool: ${name}` }],
         isError: true,
       };
-    }
-    try {
-      const raw = await executeAegisRequest(name, args ?? {});
-      const payload = (raw as any)?.data ?? raw;
-      const text = extractToolResult(name, payload);
-      return { content: [{ type: "text" as const, text }] };
     } catch (err: any) {
-      const message =
-        err?.message === "CREDITS_DEPLETED"
-          ? "Aegis credits depleted."
-          : `Error: ${err?.message}`;
       return {
-        content: [{ type: "text" as const, text: message }],
+        content: [{ type: "text", text: `Error: ${err?.message}` }],
         isError: true,
       };
     }
@@ -431,8 +625,9 @@ function createSessionMcpServer() {
   return server;
 }
 
-// --- SERVER ---
+// --- EXPRESS SERVER ---
 async function startDaemonServer(port: number) {
+  ensureBuiltinServices();
   const app = express();
   app.use(cors({ origin: true, credentials: true }));
   app.use(express.json());
@@ -469,13 +664,11 @@ async function startDaemonServer(port: number) {
     });
   });
 
-  // ROBUST PROVIDER REGISTRATION (PROBE -> TEST -> UPSERT)
   app.post("/api/provider/register", async (req, res) => {
     const { id, endpoint_url, secret, sample_request } = req.body;
     if (!SERVICE_ID_RE.test(id))
       return res.status(400).json({ error: "INVALID_ID" });
 
-    // 1. Probe Ownership
     let method: "POST" | "PUT" = "POST";
     try {
       const probe = await fetch(AEGIS_REGISTRY_STATS_ENDPOINT(id));
@@ -492,11 +685,8 @@ async function startDaemonServer(port: number) {
         }
         method = "PUT";
       }
-    } catch (e) {
-      /* fallback to POST if router unreachable */
-    }
+    } catch (e) {}
 
-    // 2. Local Test (Only on initial registration)
     if (method === "POST") {
       try {
         const test = await fetch(endpoint_url, {
@@ -519,7 +709,6 @@ async function startDaemonServer(port: number) {
       }
     }
 
-    // 3. Router Sync
     try {
       const payload =
         method === "POST"
@@ -551,35 +740,16 @@ async function startDaemonServer(port: number) {
     }
   });
 
-  app.get("/api/provider/stats/:id", async (req, res) => {
-    try {
-      const r = await fetch(AEGIS_REGISTRY_STATS_ENDPOINT(req.params.id));
-      const data = await r.json();
-      res.status(r.status).json({
-        ...data,
-        local_registered: !!loadServices()[req.params.id],
-        signer_wallet: userAccount.address,
-      });
-    } catch {
-      res.status(502).json({ error: "UNREACHABLE" });
-    }
-  });
-
   app.post("/v1/chat/completions", async (req, res) => {
     try {
       const requestedModel = req.body.model || "error_model_must_be_specified";
-
-      // Dynamic routing: map LLM families to Aegis provider services
       let serviceId = "aegis-claude";
       const m = String(requestedModel).toLowerCase();
       if (m.includes("gpt")) serviceId = "aegis-openai";
       else if (m.includes("claude")) serviceId = "aegis-claude";
 
       const rawResponse = await executeAegisRequest(serviceId, req.body);
-
-      // UNWRAP THE ENVELOPE: Give LibreChat exactly what it expects
       const llmPayload = rawResponse?.data ?? rawResponse;
-
       res.json(llmPayload);
     } catch (err: any) {
       res
@@ -588,23 +758,6 @@ async function startDaemonServer(port: number) {
     }
   });
 
-  app.post("/v1/execute", async (req, res) => {
-    try {
-      res.json(
-        await executeAegisRequest(
-          req.body.service,
-          req.body.request,
-          req.body.maxCredits,
-        ),
-      );
-    } catch (err: any) {
-      res
-        .status(err.message === "CREDITS_DEPLETED" ? 402 : 500)
-        .json({ error: err.message });
-    }
-  });
-
-  // --- MCP SSE endpoints ---
   app.get("/mcp/sse", async (_req, res) => {
     let transport: SSEServerTransport | undefined;
     let sessionServer: Server | undefined;
@@ -616,17 +769,15 @@ async function startDaemonServer(port: number) {
 
       sessionServer = createSessionMcpServer();
       transport = new SSEServerTransport("/mcp/messages", res);
-
       sseSessions.set(transport.sessionId, transport);
 
       res.on("close", () => {
         sseSessions.delete(transport!.sessionId);
-        void sessionServer!.close().catch(() => {}); // Close ONLY this session's server
+        void sessionServer!.close().catch(() => {});
         console.error(`🔌 MCP Session ${transport!.sessionId} closed cleanly`);
       });
 
       await sessionServer.connect(transport);
-      // After transport writeHead: flush so proxies forward the stream immediately
       res.flushHeaders?.();
       console.error(`🔌 Aegis MCP Handshake: Session ${transport.sessionId}`);
     } catch (err: any) {
@@ -637,25 +788,10 @@ async function startDaemonServer(port: number) {
     }
   });
 
-  // --- ANTHROPIC NATIVE ROUTE ---
-  // LibreChat's native Anthropic endpoint will hit this route instead of chat/completions
-  // --- ANTHROPIC NATIVE ROUTE ---
-  // --- ANTHROPIC NATIVE ROUTE (With Forensic Logging) ---
   app.post("/v1/messages", async (req, res) => {
     const serviceId = "aegis-claude";
     try {
-      // 1. INBOUND MONITOR
-      console.log(`\n📥 [DAEMON] INCOMING FROM LIBRECHAT:`);
-      console.log(`Model: ${req.body.model} | Stream: ${req.body.stream}`);
-      console.log(`Msg Count: ${req.body.messages?.length}`);
-      // Check for history ghosts
-      req.body.messages?.forEach((m: any, i: number) => {
-        if (!m.role)
-          console.error(`⚠️  MESSAGE AT INDEX ${i} IS MISSING A ROLE!`);
-      });
-
       const legacyModel = "claude-3-5-sonnet-20241022";
-
       let systemPrompt = req.body.system;
       if (Array.isArray(systemPrompt)) {
         systemPrompt = systemPrompt.map((b: any) => b.text || "").join("\n");
@@ -674,20 +810,12 @@ async function startDaemonServer(port: number) {
         stream: req.body.stream ?? false,
       };
 
-      Object.keys(cleanPayload).forEach((k) => {
-        if (cleanPayload[k] === undefined) delete cleanPayload[k];
-      });
-
-      // Protocol Handshake
       res.setHeader("anthropic-version", "2023-06-01");
-
       if (cleanPayload.stream) {
-        console.log("🌊 PIPE: Initiating SSE Stream...");
         await executeAegisStream(serviceId, cleanPayload, res);
       } else {
         const rawResponse = await executeAegisRequest(serviceId, cleanPayload);
         const data = rawResponse?.data ?? rawResponse;
-
         const anthropicFinal = {
           id: data.id || `msg_${randomUUID()}`,
           type: "message",
@@ -700,17 +828,9 @@ async function startDaemonServer(port: number) {
             output_tokens: data.usage?.output_tokens || 0,
           },
         };
-
-        // 2. OUTBOUND MONITOR
-        console.log(`\n📤 [DAEMON] OUTBOUND TO LIBRECHAT:`);
-        console.log(
-          JSON.stringify(anthropicFinal, null, 2).substring(0, 500) + "...",
-        );
-
         res.json(anthropicFinal);
       }
     } catch (err: any) {
-      console.error("❌ Gateway Error:", err.message);
       if (!res.headersSent)
         res.status(500).json({ error: { message: err.message } });
     }
@@ -727,7 +847,6 @@ async function startDaemonServer(port: number) {
     try {
       await transport.handlePostMessage(req, res, req.body);
     } catch (err: any) {
-      console.error("MCP POST failed:", err);
       if (!res.headersSent) res.status(500).end();
     }
   });
@@ -741,17 +860,12 @@ async function startDaemonServer(port: number) {
 
 async function main() {
   const args = process.argv.slice(2);
-
-  // --- NEW: CLAUDE DESKTOP STDIO MODE ---
   if (args.includes("--stdio")) {
     const server = createSessionMcpServer();
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error("🚀 Aegis Hub Engine Live (MCP Stdio Mode)");
-    return; // Exit here, do not start the Express web server
+    return;
   }
-  // --------------------------------------
-
   const portIndex = args.indexOf("--port");
   const port = portIndex > -1 ? parseInt(args[portIndex + 1]) : 23447;
   await startDaemonServer(port);
