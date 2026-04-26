@@ -16,8 +16,6 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { DASHBOARD_HTML } from "./dashboard.js";
-import { z } from "zod";
-import { Composio } from "@composio/core";
 
 // --- CONFIG & PATHS ---
 const CONFIG_DIR = process.env.AEGIS_HOME
@@ -27,8 +25,6 @@ const IDENTITY_PATH = path.join(CONFIG_DIR, "identity.json");
 const SERVICES_PATH = path.join(CONFIG_DIR, "services.json");
 const BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as const;
 const AEGIS_ENTERPRISE_WALLET = "0xDb11E8ba517ecB97C30a77b34C6492d2e15FD510";
-const AEGIS_USER_ID = process.env.AEGIS_USER_ID || "default";
-
 const AEGIS_ROUTER_URL =
   process.env.AEGIS_ROUTER_URL ||
   "https://aegis-router-production.up.railway.app";
@@ -42,102 +38,6 @@ const AEGIS_BALANCE_ENDPOINT = (wallet: string) =>
   `${AEGIS_ROUTER_BASE}/v1/balance/${wallet}`;
 
 const SERVICE_ID_RE = /^[a-z0-9][a-z0-9_-]{1,63}$/i;
-
-// --- COMPOSIO DIRECT INTEGRATION ---
-const composio = new Composio({
-  apiKey: process.env.COMPOSIO_API_KEY,
-});
-
-/**
- * Transforms Composio tool metadata into MCP-compatible Tool objects.
- */
-function transformComposioToMcp(toolMeta: any) {
-  // Account for different SDK metadata shapes
-  const params =
-    toolMeta.parameters || toolMeta.schema || toolMeta.expected_schema || {};
-  return {
-    name: (toolMeta.slug || toolMeta.name).toLowerCase(),
-    description:
-      toolMeta.description || `Execute ${toolMeta.name} via Composio`,
-    inputSchema: {
-      type: "object",
-      properties: params.properties || {},
-      required: params.required || [],
-      additionalProperties: false,
-    },
-  };
-}
-
-const AegisActionsInputSchema = z.object({
-  action: z.string().min(1),
-  params: z.record(z.string(), z.unknown()).default({}),
-  user_id: z.string().min(1),
-});
-
-function inferToolkitSlug(action: string): string | null {
-  const prefix = action.split("_")[0]?.trim();
-  if (!prefix) return null;
-  const slug = prefix.toLowerCase();
-  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(slug)) return null;
-  return slug;
-}
-
-async function composioHasActiveConnection(
-  userId: string,
-  toolkitSlug: string,
-): Promise<boolean> {
-  const resp: any = await composio.connectedAccounts.list({
-    userIds: [userId],
-    toolkitSlugs: [toolkitSlug],
-    statuses: ["ACTIVE"],
-  });
-  const items = Array.isArray(resp?.items) ? resp.items : [];
-  return items.length > 0;
-}
-
-async function composioCreateConnectionRequestLink(
-  userId: string,
-  toolkitSlug: string,
-): Promise<string> {
-  const request: any = await composio.toolkits.authorize(userId, toolkitSlug);
-  const redirectUrl = request?.redirectUrl;
-  if (typeof redirectUrl !== "string" || redirectUrl.length === 0) {
-    throw new Error("Composio did not return a redirectUrl for authorization.");
-  }
-  return redirectUrl;
-}
-
-/**
- * DIRECT SDK EXECUTION
- * Replaces the unreliable forwardToComposioProxy.
- */
-async function executeComposioActionDirect(
-  userId: string,
-  action: string,
-  params: any,
-) {
-  if (!process.env.COMPOSIO_API_KEY) {
-    throw new Error("COMPOSIO_API_KEY is not set.");
-  }
-
-  console.error(`\n[COMPOSIO EXECUTE] 🚀 Action: ${action} | User: ${userId}`);
-  console.error(`Params: ${JSON.stringify(params)}`);
-
-  try {
-    const result = await composio.tools.execute(action, {
-      userId,
-      arguments: params ?? {},
-      dangerouslySkipVersionCheck: true,
-    });
-
-    console.error(`[COMPOSIO SUCCESS] ✅ Result received.`);
-    return result;
-  } catch (err: any) {
-    console.error(`[COMPOSIO ERROR] ❌ SDK Crash:`, err.message);
-    if (err.cause) console.error(`[CAUSE]:`, err.cause);
-    throw err;
-  }
-}
 
 // --- VIEM & WEB3 ---
 const ERC20_ABI = [
@@ -178,8 +78,7 @@ function saveServices(data: any) {
 }
 
 function ensureBuiltinServices(): void {
-  // Intentionally no longer injects any static Composio/Aegis "actions" tool.
-  // The MCP server dynamically discovers Composio actions at runtime.
+  // Catalog is populated by provider registration (e.g. aegis-proxy); no static tool rows here.
   if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
   if (!existsSync(SERVICES_PATH)) saveServices({});
 }
@@ -313,6 +212,15 @@ async function executeAegisRequest(
   };
   if (maxCredits) headers["x-max-credits"] = String(maxCredits);
 
+  if (
+    request !== undefined &&
+    request !== null &&
+    typeof request === "object" &&
+    !Array.isArray(request)
+  ) {
+    (request as Record<string, unknown>)._wallet_id = userAccount.address;
+  }
+
   const response = await fetch(AEGIS_EXECUTE_ENDPOINT, {
     method: "POST",
     headers,
@@ -423,6 +331,11 @@ function extractToolResult(serviceId: string, data: unknown): string {
     }
     if (lines.length > 0) return lines.join("\n");
   }
+  if (serviceId === "aegis-composio") {
+    const parsed = data as any;
+    if (typeof parsed?.redirectUrl === "string" && parsed.redirectUrl.length > 0)
+      return `Please login here: ${parsed.redirectUrl}`;
+  }
   try {
     return JSON.stringify(data);
   } catch {
@@ -475,38 +388,10 @@ function createSessionMcpServer() {
   mcpServerInstance = server;
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const catalogTools = buildToolsFromServicesCatalog();
     return {
       tools: [
-        {
-          name: "aegis_composio",
-          description:
-            "Primary gateway for 200+ 3rd-party apps including GitHub, Slack, Salesforce, Jira, Asana, HubSpot, Shopify, etc. Use this by default whenever the user asks to fetch or modify data in an external service, even if they don't explicitly ask for it. Workflow: use 'login' to authorize, 'explore' to discover available tools for an app, and 'execute' to run a specific tool.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              action: {
-                type: "string",
-                enum: ["login", "explore", "execute"],
-                description: "The operation to perform.",
-              },
-              app: {
-                type: "string",
-                description: "The app name (e.g., 'github').",
-              },
-              tool_name: {
-                type: "string",
-                description:
-                  "The specific Composio tool slug (Required for 'execute').",
-              },
-              tool_params: {
-                type: "object",
-                description:
-                  "Parameters for the tool (Required for 'execute').",
-              },
-            },
-            required: ["action", "app"],
-          },
-        },
+        ...catalogTools,
         {
           name: "aegis_hub",
           description: "Executes native Aegis microservices.",
@@ -532,65 +417,8 @@ function createSessionMcpServer() {
 
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const { name, arguments: args } = req.params as any;
-    const AEGIS_USER_ID = process.env.AEGIS_USER_ID || "default";
 
     try {
-      // --- 1. COMPOSIO META-TOOL ---
-      if (name === "aegis_composio") {
-        const { action, app, tool_name, tool_params } = (args ?? {}) as any;
-
-        if (action === "login") {
-          const request: any = await composio.toolkits.authorize(
-            AEGIS_USER_ID,
-            app,
-          );
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Please login here: ${request.redirectUrl}`,
-              },
-            ],
-          };
-        }
-
-        if (action === "explore") {
-          console.error(`🔍 Exploring tools for app: ${app}`);
-          const rawTools = await (composio.tools as any).getRawComposioTools({
-            toolkits: [app],
-          });
-
-          // Return a lightweight summary to the LLM to save context
-          const toolSummary = rawTools.map((t: any) => ({
-            name: t.name || t.slug,
-            description: t.description,
-            schema: t.parameters || t.schema || t.expected_schema,
-          }));
-
-          return {
-            content: [
-              { type: "text", text: JSON.stringify(toolSummary, null, 2) },
-            ],
-          };
-        }
-
-        if (action === "execute") {
-          if (!tool_name)
-            throw new Error("tool_name is required for execute action.");
-          const result = await executeComposioActionDirect(
-            AEGIS_USER_ID,
-            tool_name,
-            tool_params ?? {},
-          );
-          const text =
-            typeof result === "string"
-              ? result
-              : JSON.stringify(result, null, 2);
-          return { content: [{ type: "text", text }] };
-        }
-      }
-
-      // --- 2. AEGIS NATIVE META-TOOL ---
       if (name === "aegis_hub") {
         const { service, params } = (args ?? {}) as any;
 
@@ -610,8 +438,16 @@ function createSessionMcpServer() {
         return { content: [{ type: "text", text }] };
       }
 
+      const catalog = loadServices();
+      if (catalog[name]) {
+        const raw = await executeAegisRequest(name, args ?? {});
+        const payload = (raw as any)?.data ?? raw;
+        const text = extractToolResult(name, payload);
+        return { content: [{ type: "text", text }] };
+      }
+
       return {
-        content: [{ type: "text", text: `Unknown meta-tool: ${name}` }],
+        content: [{ type: "text", text: `Unknown tool: ${name}` }],
         isError: true,
       };
     } catch (err: any) {
@@ -712,7 +548,11 @@ async function startDaemonServer(port: number) {
     try {
       const payload =
         method === "POST"
-          ? { ...req.body, provider_wallet: userAccount.address }
+          ? {
+              ...req.body,
+              provider_wallet: userAccount.address,
+              provider_secret: secret,
+            }
           : { ...req.body, new_secret: secret };
       const sync = await fetch(AEGIS_REGISTER_ENDPOINT, {
         method,
